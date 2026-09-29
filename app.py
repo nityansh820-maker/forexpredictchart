@@ -7,7 +7,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="EUR/USD ANN Signal Demo", layout="wide")
-
+st.write("App started")
 FEATURES = ['ret_1', 'ret_5', 'candle_dir', 'rsi', 'macd_hist',
             'atr_pct', 'dist_sma20', 'bb_pctb']
 THR, SL_MULT, RR = 0.40, 1.5, 1.5      # project parameters (chosen on validation data)
