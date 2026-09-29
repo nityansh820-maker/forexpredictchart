@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+scikit-learn==1.6.1
+joblib
+ta
+matplotlib
+yfinance==1.7.0
+curl_cffi==0.13.0
