@@ -1,149 +1,147 @@
-import streamlit as st
-import streamlit.components.v1 as components
-import yfinance as yf
-import pandas as pd
+import os
 import numpy as np
+import pandas as pd
 import joblib
-import plotly.graph_objects as go
-from tensorflow.keras.models import load_model
+import ta
+import yfinance as yf
+import streamlit as st
+import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="EUR/USD Forex ANN Dashboard (15M)", layout="wide")
+st.set_page_config(page_title="EUR/USD ANN Signal Demo", layout="wide")
 
-st.title("📈 EUR/USD Live Forex Trading Signal Assistant (15-Min)")
-st.caption("Powered by Artificial Neural Network (Keras MLP)")
+FEATURES = ['ret_1', 'ret_5', 'candle_dir', 'rsi', 'macd_hist',
+            'atr_pct', 'dist_sma20', 'bb_pctb']
+THR, SL_MULT, RR = 0.40, 1.5, 1.5      # project parameters (chosen on validation data)
 
-# Auto-refresh page every 60 seconds automatically
-components.html(
-    """
-    <script>
-        setTimeout(function() {
-            window.parent.location.reload();
-        }, 60000);
-    </script>
-    """,
-    height=0
-)
 
-# Refresh Button
-if st.button("🔄 Refresh Market Data Now"):
-    st.rerun()
-
-# 1. Load Pre-Trained Model & Scaler
 @st.cache_resource
 def load_assets():
     scaler = joblib.load('scaler.pkl')
-    model  = load_model('forex_ann.keras')
-    return scaler, model
+    if os.path.exists('weights.npz'):                      # TensorFlow-free path
+        d = np.load('weights.npz')
+        W = [d[f'arr_{i}'] for i in range(6)]
 
-scaler, model = load_assets()
+        def predict(X):
+            h = np.maximum(X @ W[0] + W[1], 0)             # Dense 64, ReLU
+            h = np.maximum(h @ W[2] + W[3], 0)             # Dense 32, ReLU
+            z = h @ W[4] + W[5]                            # Dense 3
+            e = np.exp(z - z.max(axis=1, keepdims=True))   # softmax
+            return e / e.sum(axis=1, keepdims=True)
+        return scaler, predict
 
-# 2. Indicator Calculation Pipeline
-def calculate_indicators(df):
-    df = df.copy()
+    from tensorflow.keras.models import load_model         # fallback (needs TensorFlow)
+    model = load_model('forex_ann.keras')
+    return scaler, (lambda X: model.predict(X, verbose=0))
 
-    close = df['Close'].squeeze()
-    open_p = df['Open'].squeeze()
-    high = df['High'].squeeze()
-    low = df['Low'].squeeze()
 
-    # RSI 14
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
+@st.cache_data(ttl=300)
+def fetch_data():
+    raw = yf.download('EURUSD=X', period='60d', interval='1h',
+                      progress=False, auto_adjust=False)
+    if raw.empty:
+        return None
+    raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
+    d = raw.rename(columns=str.lower)[['open', 'high', 'low', 'close']].dropna()
+    d.index = pd.to_datetime(d.index).tz_convert('UTC').tz_localize(None)
+    now = pd.Timestamp.now(tz='UTC').tz_localize(None)
+    return d[d.index + pd.Timedelta(hours=1) <= now]       # closed candles only
 
-    # MACD Histogram
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    df['macd_hist'] = (macd - signal) / close
 
-    # ATR & ATR%
-    high_low = high - low
-    high_close = np.abs(high - close.shift())
-    low_close = np.abs(low - close.shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['atr'] = tr.rolling(14).mean()
-    df['atr_pct'] = df['atr'] / close
+def build_features(d):
+    """Same feature definitions as training."""
+    d = d.copy()
+    c = d['close']
+    d['ret_1'] = c.pct_change(1)
+    d['ret_5'] = c.pct_change(5)
+    d['candle_dir'] = np.sign(d['close'] - d['open'])
+    d['rsi'] = ta.momentum.rsi(c, window=14)
+    d['macd_hist'] = ta.trend.macd_diff(c) / c
+    d['atr'] = ta.volatility.average_true_range(d['high'], d['low'], c, window=14)
+    d['atr_pct'] = d['atr'] / c
+    d['dist_sma20'] = c / ta.trend.sma_indicator(c, 20) - 1
+    d['bb_pctb'] = ta.volatility.bollinger_pband(c, window=20)
+    return d
 
-    # Distance to SMA 20
-    sma20 = close.rolling(20).mean()
-    df['dist_sma20'] = (close - sma20) / sma20
 
-    # Bollinger Bands %B
-    std20 = close.rolling(20).std()
-    upper = sma20 + (2 * std20)
-    lower = sma20 - (2 * std20)
-    df['bb_pctb'] = (close - lower) / (upper - lower)
+# ---------------- Page ----------------
+st.title("EUR/USD Hourly ANN Signal Demo")
+st.caption("Educational machine-learning project. Not financial advice. "
+           "Paper/demo use only; past performance does not predict future results.")
 
-    # Returns & Direction
-    df['ret_1'] = close.pct_change(1)
-    df['ret_5'] = close.pct_change(5)
-    df['direction'] = np.where(close > open_p, 1, -1)
+if st.button("🔄 Refresh Market Data Now"):
+    st.cache_data.clear()
+    st.rerun()
 
-    return df
+try:
+    scaler, predict = load_assets()
+except Exception as e:
+    st.error(f"Could not load the model files: {e}")
+    st.stop()
 
-# 3. Fetch Live 15-Minute Market Data
-st.info("Fetching latest live 15-minute EUR/USD candles...")
-data = yf.download('EURUSD=X', period='5d', interval='15m', progress=False)
+live = fetch_data()
+if live is None or len(live) < 100:
+    st.error("No market data returned (rate limit, library error, or market closed). Try again later.")
+    st.stop()
 
-if isinstance(data.columns, pd.MultiIndex):
-    data.columns = data.columns.get_level_values(0)
+f = build_features(live).dropna(subset=FEATURES)
+probs_all = predict(scaler.transform(f[FEATURES].values))
+pred_all, conf_all = probs_all.argmax(axis=1), probs_all.max(axis=1)
+sig_all = np.where((pred_all != 1) & (conf_all >= THR),
+                   np.where(pred_all == 2, 'BUY', 'SELL'), 'HOLD')
 
-df = calculate_indicators(data).dropna()
+# Latest closed candle
+probs, signal = probs_all[-1], sig_all[-1]
+row = f.iloc[-1]
+entry, risk = float(row['close']), SL_MULT * float(row['atr'])
+sl = tp = None
+if signal == 'BUY':
+    sl, tp = entry - risk, entry + RR * risk
+elif signal == 'SELL':
+    sl, tp = entry + risk, entry - RR * risk
 
-# 4. Neural Network Inference on Latest Candle
-features = ['rsi', 'macd_hist', 'atr_pct', 'dist_sma20', 'bb_pctb', 'ret_1', 'ret_5', 'direction']
-X_live = df[features].iloc[-1:].values
-X_scaled = scaler.transform(X_live)
-
-probs = model.predict(X_scaled)
-classes = ['SELL', 'HOLD', 'BUY']
-pred_idx = int(np.argmax(probs))
-pred_class = classes[pred_idx]
-confidence = float(np.max(probs) * 100)
-
-latest = df.iloc[-1]
-
-close_val = latest['Close']
-current_price = float(close_val.iloc) if isinstance(close_val, (pd.Series, np.ndarray)) else float(close_val)
-
-atr_raw = latest['atr']
-atr_val = float(atr_raw.iloc) if isinstance(atr_raw, (pd.Series, np.ndarray)) else float(atr_raw)
-
-# Risk Management calculation
-sl = None
-tp = None
-if pred_class == 'BUY':
-    sl = current_price - (1.5 * atr_val)
-    tp = current_price + (2.25 * atr_val)
-elif pred_class == 'SELL':
-    sl = current_price + (1.5 * atr_val)
-    tp = current_price - (2.25 * atr_val)
-
-# 5. Display Metric Cards
 c1, c2, c3, c4 = st.columns(4)
-c1.metric(label="Live Rate (EUR/USD)", value=f"${current_price:.5f}")
-c2.metric(label="ANN Prediction (15M)", value=str(pred_class), delta=f"{confidence:.1f}% Prob.")
-c3.metric(label="Stop Loss (SL)", value=f"${sl:.5f}" if sl is not None else "N/A")
-c4.metric(label="Take Profit (TP)", value=f"${tp:.5f}" if tp is not None else "N/A")
+c1.metric("Signal", signal)
+c2.metric("Confidence", f"{probs.max():.1%}")
+c3.metric("Last closed candle (UTC)", f.index[-1].strftime("%Y-%m-%d %H:%M"))
+c4.metric("Reference price", f"{entry:.5f}")
 
-# 6. Interactive Plotly Candlestick Chart (Last 40 15M candles)
-chart_df = df.tail(40)
-fig = go.Figure(data=[go.Candlestick(
-    x=chart_df.index,
-    open=chart_df['Open'].squeeze(),
-    high=chart_df['High'].squeeze(),
-    low=chart_df['Low'].squeeze(),
-    close=chart_df['Close'].squeeze(),
-    name="EUR/USD 15M"
-)])
-fig.update_layout(
-    title="Recent 15-Minute Candlestick Price Movement",
-    xaxis_rangeslider_visible=False,
-    template="plotly_dark",
-    height=450
-)
-st.plotly_chart(fig, use_container_width=True)
+if signal == 'HOLD':
+    st.info(f"No trade: the model's top probability is below the {THR:.0%} confidence threshold "
+            f"or its top class is HOLD.")
+else:
+    a, b, c = st.columns(3)
+    a.metric("Entry (last close, approx.)", f"{entry:.5f}")
+    b.metric("Stop loss (1.5 x ATR)", f"{sl:.5f}")
+    c.metric("Take profit (RR 1.5)", f"{tp:.5f}")
+
+st.subheader("Model probabilities")
+st.bar_chart(pd.Series({'SELL': probs[0], 'HOLD': probs[1], 'BUY': probs[2]}))
+
+st.subheader("Recent candles")
+recent = live.tail(120)
+fig, ax = plt.subplots(figsize=(11, 4))
+ax.plot(recent.index, recent['close'], color='black', lw=1, label='Close')
+if signal != 'HOLD':
+    ax.axhline(entry, color='blue', ls='--', lw=0.9, label='Entry')
+    ax.axhline(sl, color='red', ls='--', lw=0.9, label='SL')
+    ax.axhline(tp, color='green', ls='--', lw=0.9, label='TP')
+ax.set_ylabel("Price")
+ax.legend(loc='upper left')
+fig.autofmt_xdate()
+st.pyplot(fig)
+
+st.subheader("Most recent BUY/SELL signals (last ~60 days)")
+hist = pd.DataFrame({'candle_start (UTC)': f.index, 'signal': sig_all,
+                     'confidence': conf_all.round(3), 'close': f['close'].values})
+hist = hist[hist['signal'] != 'HOLD'].tail(10).iloc[::-1]
+st.dataframe(hist, use_container_width=True, hide_index=True)
+
+with st.expander("About this demo and its limits"):
+    st.write(
+        "- MLP classifier (8 inputs, 64-32 hidden units, 3 outputs) trained on 2005-2015 EUR/USD hourly data.\n"
+        "- Labels: future 4-candle move compared with 0.8 x ATR. Signals need confidence of at least 40%.\n"
+        "- SL = 1.5 x ATR, TP = 1.5 x risk. Entry shown is the last close; a real fill would be the next open.\n"
+        "- Historical backtests were weak: classification precision was only slightly above chance, and "
+        "trading results were worse than random on 2015-2020 data.\n"
+        "- Live data comes from Yahoo Finance and differs from the training data source."
+    )
